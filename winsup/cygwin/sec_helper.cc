@@ -480,9 +480,11 @@ set_cygwin_privileges (HANDLE token)
   /* Setting these rights at process startup allows processes running under
      user tokens which are in the administrstors group to have root-like
      permissions. */
+#if 0 /* Breaks access to some SMBv1 servers */
   /* Allow to access all files, independent of their ACL settings. */
   set_privilege (token, SE_RESTORE_PRIVILEGE, true);
   set_privilege (token, SE_BACKUP_PRIVILEGE, true);
+#endif
   /* Allow full access to other user's processes. */
   set_privilege (token, SE_DEBUG_PRIVILEGE, true);
 #if 0
