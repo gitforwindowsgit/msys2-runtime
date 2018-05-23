@@ -362,6 +362,7 @@ exit_one_process(HANDLE process, int exit_code)
   LPTHREAD_START_ROUTINE address = NULL;
   int signo = exit_code & 0x7f;
 
+TODO: use IsProcessCritical() if available (Windows 8.1 and later) to skip this
   switch (signo)
     {
       case SIGINT:
