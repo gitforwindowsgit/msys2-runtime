@@ -80,6 +80,15 @@ public:
   {
     WriteConsoleA (handle, buf, ixput, wn, 0);
   }
+  inline char *c_str (size_t *psize = NULL)
+  {
+    size_t size = ixput < WPBUF_LEN ? ixput : WPBUF_LEN - 1;
+    buf[size] = '\0';
+    if (psize != NULL) {
+      *psize = size;
+    }
+    return (char *) buf;
+  }
 } wpbuf;
 
 static void
@@ -3203,7 +3212,14 @@ fhandler_console::write (const void *vsrc, size_t len)
 	    if (*src < ' ')
 	      {
 		if (wincap.has_con_24bit_colors () && !con_is_legacy)
-		  wpbuf.send (get_output_handle ());
+		  {
+		    size_t nms;
+		    char *ms = wpbuf.c_str(&nms);
+		    wchar_t write_buf[TITLESIZE + 1];
+		    DWORD done;
+		    DWORD buf_len = sys_mbstowcs (write_buf, TITLESIZE, ms);
+		    write_console (write_buf, buf_len, done);
+		  }
 		else if (*src == '\007' && con.state == gettitle)
 		  set_console_title (con.my_title_buf);
 		con.state = normal;
