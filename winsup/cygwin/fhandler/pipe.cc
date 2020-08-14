@@ -503,8 +503,9 @@ fhandler_pipe_fifo::raw_write (const void *ptr, size_t len)
 		      raise (SIGPIPE);
 		      goto out;
 		    }
-		  else
-		    cygwait (select_sem, 10, cw_cancel);
+		  /* Break out on completion */
+		  if (waitret == WAIT_OBJECT_0)
+		    break;
 		  /* If we got a timeout in the blocking case, and we already
 		     did a short write, we got a signal in the previous loop. */
 		  if (waitret == WAIT_TIMEOUT && short_write_once)
@@ -512,6 +513,7 @@ fhandler_pipe_fifo::raw_write (const void *ptr, size_t len)
 		      waitret = WAIT_SIGNALED;
 		      break;
 		    }
+		  cygwait (select_sem, 10, cw_cancel);
 		}
 	      /* Loop in case of blocking write or SA_RESTART */
 	      while (waitret == WAIT_TIMEOUT || waitret == WAIT_SIGNALED);
@@ -727,7 +729,11 @@ fhandler_pipe::close ()
   return ret;
 }
 
+#ifdef __MSYS__
+#define PIPE_INTRO "\\\\.\\pipe\\msys-"
+#else
 #define PIPE_INTRO "\\\\.\\pipe\\cygwin-"
+#endif
 
 /* Create a pipe, and return handles to the read and write ends,
    just like CreatePipe, but ensure that the write end permits
