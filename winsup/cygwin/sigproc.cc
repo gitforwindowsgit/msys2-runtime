@@ -1412,7 +1412,8 @@ wait_sig (VOID *)
 	  sig_held = true;
 	  break;
 	case __SIGSETPGRP:
-	  init_console_handler (true);
+	  init_console_handler (::cygheap->ctty
+				&& ::cygheap->ctty->is_console ());
 	  break;
 	case __SIGTHREADEXIT:
 	  {
@@ -1475,6 +1476,16 @@ wait_sig (VOID *)
 	      if (pack.si.si_signo == SIGCHLD)
 		clearwait = true;
 	    }
+	  break;
+	case __SIGNONCYGCHLD:
+	  cygheap_fdenum cfd (false);
+	  while (cfd.next () >= 0)
+	    if (cfd->get_dev () == FH_PIPEW)
+	      {
+		fhandler_pipe *pipe = (fhandler_pipe *)(fhandler_base *) cfd;
+		if (pipe->need_close_query_hdl ())
+		  pipe->close_query_handle ();
+	      }
 	  break;
 	}
       if (clearwait && !have_execed)
