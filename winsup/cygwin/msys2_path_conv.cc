@@ -406,6 +406,13 @@ skip_p2w:
 
     path_type result = NONE;
 
+    if (it + 1 == end) {
+        switch (*it) {
+        case '/':   return ROOTED_PATH ;
+        default:    return SIMPLE_WINDOWS_PATH;
+        }
+    }
+
     if (isalpha(*it) && *(it + 1) == ':') {
         if (*(it + 2) == '\\') {
             return SIMPLE_WINDOWS_PATH;
