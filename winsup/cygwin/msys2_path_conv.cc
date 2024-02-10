@@ -366,7 +366,6 @@ skip_p2w:
         switch (*it) {
         case '`':
         case '\'':
-        case '"':
         case '*':
         case '?':
         case '[':
