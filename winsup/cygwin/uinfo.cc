@@ -928,36 +928,44 @@ fetch_from_path (cyg_ldap *pldap, PUSER_INFO_3 ui, cygpsid &sid, PCWSTR str,
   return ret;
 }
 
-static size_t
-fetch_env(LPCWSTR key, char *buf, size_t size)
-{
-  WCHAR wbuf[32767];
-  DWORD max = sizeof wbuf / sizeof *wbuf;
-  DWORD len = GetEnvironmentVariableW (key, wbuf, max);
-
-  if (!len || len >= max)
-    return 0;
-
-  len = sys_wcstombs (buf, size, wbuf, len);
-  return len && len < size ? len : 0;
-}
-
 static char *
 fetch_home_env (void)
 {
-  char home[32767];
-  size_t max = sizeof home / sizeof *home, len;
-
-  if (fetch_env (L"HOME", home, max)
-      || ((len = fetch_env (L"HOMEDRIVE", home, max))
-        && fetch_env (L"HOMEPATH", home + len, max - len))
-      || fetch_env (L"USERPROFILE", home, max))
+  /* If `HOME` is set, prefer it */
+  const char *home = getenv ("HOME");
+  if (home)
     {
-      tmp_pathbuf tp;
-      cygwin_conv_path (CCP_WIN_A_TO_POSIX | CCP_ABSOLUTE,
-	  home, tp.c_get(), NT_MAX_PATH);
-      return strdup(tp.c_get());
+      /* In the very early code path of `user_info::initialize ()`, the value
+         of the environment variable `HOME` is still in its Windows form. */
+      if (isdrive (home) || home[0] == '\\')
+	return (char *) cygwin_create_path (CCP_WIN_A_TO_POSIX, home);
+      return strdup (home);
     }
+
+  /* If `HOME` is unset, fall back to `HOMEDRIVE``HOMEPATH`
+     (without a directory separator, as `HOMEPATH` starts with one). */
+  const char *home_drive = getenv ("HOMEDRIVE");
+  if (home_drive)
+    {
+      const char *home_path = getenv ("HOMEPATH");
+      if (home_path)
+	{
+	  tmp_pathbuf tp;
+	  char *p = tp.c_get (), *q;
+
+	  // concatenate HOMEDRIVE and HOMEPATH
+	  q = stpncpy (p, home_drive, NT_MAX_PATH);
+	  strlcpy (q, home_path, NT_MAX_PATH - (q - p));
+	  return (char *) cygwin_create_path (CCP_WIN_A_TO_POSIX, p);
+	}
+    }
+
+  /* If neither `HOME` nor `HOMEDRIVE``HOMEPATH` are set, fall back
+     to `USERPROFILE`; In corporate setups, this might point to a
+     disconnected network share, hence this is the last fall back. */
+  home = getenv ("USERPROFILE");
+  if (home)
+    return (char *) cygwin_create_path (CCP_WIN_A_TO_POSIX, home);
 
   return NULL;
 }
@@ -1038,8 +1046,6 @@ cygheap_pwdgrp::get_home (PUSER_INFO_3 ui, cygpsid &sid, PCWSTR dom,
 
   for (uint16_t idx = 0; !home && idx < NSS_SCHEME_MAX; ++idx)
     {
-      if (!ui && home_scheme[idx].method != NSS_SCHEME_ENV)
-        continue;
       switch (home_scheme[idx].method)
 	{
 	case NSS_SCHEME_FALLBACK:
@@ -1490,9 +1496,9 @@ get_logon_sid ()
     }
 }
 
-/* Fetch special AzureAD group, which is part of the token group list but
-   *not* recognized by LookupAccountSid (ERROR_NONE_MAPPED). */
-static cygsid azure_grp_sid ("");
+/* Fetch special AzureAD and IIS APPPOOL groups, which are part of the token
+   group list but *not* recognized by LookupAccountSid (ERROR_NONE_MAPPED). */
+static cygsid azure_grp_sid (""), iis_apppool_grp_sid ("");
 
 static void
 get_azure_grp_sid ()
@@ -1516,6 +1522,36 @@ get_azure_grp_sid ()
 		azure_grp_sid = groups->Groups[pg].Sid;
 		break;
 	      }
+	}
+    }
+}
+
+static void
+get_iis_apppool_grp_sid ()
+{
+  if (PSID (iis_apppool_grp_sid) == NO_SID)
+    {
+      NTSTATUS status;
+      ULONG size;
+      tmp_pathbuf tp;
+      PTOKEN_GROUPS groups = (PTOKEN_GROUPS) tp.w_get ();
+
+      status = NtQueryInformationToken (hProcToken, TokenGroups, groups,
+					2 * NT_MAX_PATH, &size);
+      if (!NT_SUCCESS (status))
+	debug_printf ("NtQueryInformationToken (TokenGroups) %y", status);
+      else
+	{
+	  for (DWORD pg = 0; pg < groups->GroupCount; ++pg)
+	    {
+	      PSID sid = groups->Groups[pg].Sid;
+	      if (sid_id_auth (sid) == 5 &&
+		  sid_sub_auth (sid, 0) == SECURITY_APPPOOL_ID_BASE_RID)
+		{
+		  iis_apppool_grp_sid = sid;
+		  break;
+		}
+	    }
 	}
     }
 }
@@ -1801,6 +1837,16 @@ pwdgrp::construct_sid_from_name (cygsid &sid, wchar_t *name, wchar_t *sep)
 	}
       return false;
     }
+  if (sep && wcscmp (name, L"IIS APPPOOL\\Group") == 0)
+    {
+      get_iis_apppool_grp_sid ();
+      if (PSID (logon_sid) != NO_SID)
+	{
+	  sid = iis_apppool_grp_sid;
+	  return true;
+	}
+      return false;
+    }
   if (!sep && wcscmp (name, L"CurrentSession") == 0)
     {
       get_logon_sid ();
@@ -2024,8 +2070,11 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
       /* Last but not least, some validity checks on the name style. */
       if (!fq_name)
 	{
-	  /* AzureAD user must be prepended by "domain" name. */
-	  if (sid_id_auth (sid) == 12)
+	  /* AzureAD and IIS APPPOOL users must be prepended by "domain"
+	     name. */
+	  if (sid_id_auth (sid) == 12 ||
+	      (sid_id_auth (sid) == 5 &&
+	       sid_sub_auth (sid, 0) == SECURITY_APPPOOL_ID_BASE_RID))
 	    return NULL;
 	  /* name_only account is either builtin or primary domain, or
 	     account domain on non-domain machines. */
@@ -2051,8 +2100,10 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
 	}
       else
 	{
-	  /* AzureAD accounts should be fully qualifed either. */
-	  if (sid_id_auth (sid) == 12)
+	  /* AzureAD and IIS APPPOOL accounts should be fully qualifed either. */
+	  if (sid_id_auth (sid) == 12 ||
+	      (sid_id_auth (sid) == 5 &&
+	       sid_sub_auth (sid, 0) == SECURITY_APPPOOL_ID_BASE_RID))
 	    break;
 	  /* Otherwise, no fully_qualified for builtin accounts, except for
 	     NT SERVICE, for which we require the prefix.  Note that there's
@@ -2131,6 +2182,19 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
 	  sid = csid = azure_grp_sid;
 	  break;
 	}
+      else if (arg.id == 0x1002)
+        {
+	  /* IIS APPPOOL S-1-5-82-* user */
+	  csid = cygheap->user.saved_sid ();
+	}
+      else if (arg.id == 0x1003)
+        {
+	  /* Special IIS APPPOOL group SID */
+	  get_iis_apppool_grp_sid ();
+	  /* LookupAccountSidW will fail. */
+	  sid = csid = iis_apppool_grp_sid;
+	  break;
+	}
       else if (arg.id == 0xfffe)
 	{
 	  /* Special case "nobody" for reproducible construction of a
@@ -2187,9 +2251,6 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
 	{
 	  /* Just some fake. */
 	  sid = csid.create (99, 1, 0);
-	  if (arg.id == cygheap->user.real_uid)
-	    home = cygheap->pg.get_home(NULL, cygheap->user.sid(),
-	      NULL, NULL, false);
 	  break;
 	}
       else if (arg.id >= UNIX_POSIX_OFFSET)
@@ -2245,7 +2306,7 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
 	  && (sid_sub_auth_count (sid) <= 3 || sid_id_auth (sid) == 11))
 	{
 	  acc_type = SidTypeWellKnownGroup;
-	  home = cygheap->pg.get_home (pldap, sid, dom, domain, name,
+	  home = cygheap->pg.get_home ((PUSER_INFO_3) NULL, sid, dom, name,
 				       fully_qualified_name);
 	}
       switch ((int) acc_type)
@@ -2262,7 +2323,9 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
 
 		 Those we let pass, but no others. */
 	      bool its_ok = false;
-	      if (sid_id_auth (sid) == 12)
+	      if (sid_id_auth (sid) == 12 ||
+		  (sid_id_auth (sid) == 5 &&
+		   sid_sub_auth (sid, 0) == SECURITY_APPPOOL_ID_BASE_RID))
 		its_ok = true;
 	      else if (wincap.has_microsoft_accounts ())
 		{
@@ -2351,10 +2414,25 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
 		    posix_offset = fetch_posix_offset (td, &loc_ldap);
 		}
 	    }
-	  /* AzureAD S-1-12-1-W-X-Y-Z user */
+	  /* AzureAD S-1-12-1-W-X-Y-Z and IIS APPOOL S-1-5-82-* user */
 	  else if (sid_id_auth (sid) == 12)
 	    {
 	      uid = gid = 0x1000;
+	      fully_qualified_name = true;
+	      home = cygheap->pg.get_home ((PUSER_INFO_3) NULL, sid, dom, name,
+					   fully_qualified_name);
+	      shell = cygheap->pg.get_shell ((PUSER_INFO_3) NULL, sid, dom,
+					     name, fully_qualified_name);
+	      gecos = cygheap->pg.get_gecos ((PUSER_INFO_3) NULL, sid, dom,
+					     name, fully_qualified_name);
+	      break;
+	    }
+	  /* IIS APPOOL S-1-5-82-* user */
+	  else if (sid_id_auth (sid) == 5 &&
+		   sid_sub_auth (sid, 0) == SECURITY_APPPOOL_ID_BASE_RID)
+	    {
+	      uid = 0x1002;
+	      gid = 0x1003;
 	      fully_qualified_name = true;
 	      home = cygheap->pg.get_home ((PUSER_INFO_3) NULL, sid, dom, name,
 					   fully_qualified_name);
@@ -2635,6 +2713,20 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
       fully_qualified_name = true;
       acc_type = SidTypeUnknown;
     }
+  else if (sid_id_auth (sid) == 5 &&
+	   sid_sub_auth (sid, 0) == SECURITY_APPPOOL_ID_BASE_RID)
+    {
+      /* Special IIS APPPOOL group SID which can't be resolved by
+         LookupAccountSid (ERROR_NONE_MAPPED).  This is only allowed
+	 as group entry, not as passwd entry. */
+      if (is_passwd ())
+	return NULL;
+      uid = gid = 0x1003;
+      wcpcpy (dom, L"IIS APPPOOL");
+      wcpcpy (name = namebuf, L"Group");
+      fully_qualified_name = true;
+      acc_type = SidTypeUnknown;
+    }
   else if (sid_id_auth (sid) == 5 /* SECURITY_NT_AUTHORITY */
 	   && sid_sub_auth (sid, 0) == SECURITY_LOGON_IDS_RID)
     {
@@ -2743,11 +2835,10 @@ pwdgrp::fetch_account_from_windows (fetch_user_arg_t &arg, cyg_ldap *pldap)
      logon.  Unless it's the SYSTEM account.  This conveniently allows to
      logon interactively as SYSTEM for debugging purposes. */
   else if (acc_type != SidTypeUser && sid != well_known_system_sid)
-    __small_sprintf (linebuf, "%W:*:%u:%u:U-%W\\%W,%s:%s:/sbin/nologin",
+    __small_sprintf (linebuf, "%W:*:%u:%u:U-%W\\%W,%s:/:/sbin/nologin",
 		     posix_name, uid, gid,
 		     dom, name,
-		     sid.string ((char *) sidstr),
-		     home ? home : "/");
+		     sid.string ((char *) sidstr));
   else
     __small_sprintf (linebuf, "%W:*:%u:%u:%s%sU-%W\\%W,%s:%s%W:%s",
 		     posix_name, uid, gid,
