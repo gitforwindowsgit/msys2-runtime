@@ -3378,7 +3378,8 @@ restart:
 	    }
 	  status = NtOpenFile (&h, READ_CONTROL | FILE_READ_ATTRIBUTES,
 			       &attr, &io, FILE_SHARE_VALID_FLAGS,
-			       FILE_OPEN_REPARSE_POINT
+			       FILE_OPEN_NO_RECALL
+			       | FILE_OPEN_REPARSE_POINT
 			       | FILE_OPEN_FOR_BACKUP_INTENT);
 	  debug_printf ("%y = NtOpenFile (no-EAs %S)", status, &upath);
 	}
@@ -3595,7 +3596,11 @@ restart:
 	 directory using a relative path, symlink evaluation goes totally
 	 awry.  We never want a virtual drive evaluated as symlink. */
       if (upath.Length <= 14)
-	  goto file_not_symlink;
+	goto file_not_symlink;
+
+      /* Offline files, even if reparse points, are not symlinks. */
+      if (isoffline (fileattr))
+	goto file_not_symlink;
 
       /* Reparse points are potentially symlinks.  This check must be
 	 performed before checking the SYSTEM attribute for sysfile
@@ -3641,7 +3646,8 @@ restart:
 
 	  status = NtOpenFile (&sym_h, SYNCHRONIZE | GENERIC_READ, &attr, &io,
 			       FILE_SHARE_VALID_FLAGS,
-			       FILE_OPEN_FOR_BACKUP_INTENT
+			       FILE_OPEN_NO_RECALL
+			       | FILE_OPEN_FOR_BACKUP_INTENT
 			       | FILE_SYNCHRONOUS_IO_NONALERT);
 	  if (!NT_SUCCESS (status))
 	    res = 0;
@@ -3685,7 +3691,8 @@ restart:
 
 	  status = NtOpenFile (&sym_h, SYNCHRONIZE | GENERIC_READ, &attr, &io,
 			       FILE_SHARE_VALID_FLAGS,
-			       FILE_OPEN_FOR_BACKUP_INTENT
+			       FILE_OPEN_NO_RECALL
+			       | FILE_OPEN_FOR_BACKUP_INTENT
 			       | FILE_SYNCHRONOUS_IO_NONALERT);
 
 	  if (!NT_SUCCESS (status))
