@@ -18,6 +18,7 @@ details. */
 #include "pinfo.h"
 #include "shared_info.h"
 #include "tls_pbuf.h"
+#include "sigproc.h"
 #include <assert.h>
 
 /* This is only to be used for writing.  When reading,
@@ -585,6 +586,17 @@ fhandler_pipe::fixup_after_fork (HANDLE parent)
 
   fhandler_base::fixup_after_fork (parent);
   ReleaseMutex (hdl_cnt_mtx);
+}
+
+void
+fhandler_pipe::fixup_after_exec ()
+{
+  /* Set read pipe itself always non-blocking for cygwin process.
+     Blocking/non-blocking is simulated in raw_read(). For write
+     pipe, follow is_nonblocking(). */
+  bool mode = get_device () == FH_PIPEW ? is_nonblocking () : true;
+  set_pipe_non_blocking (mode);
+  fhandler_base::fixup_after_exec ();
 }
 
 int
@@ -1207,53 +1219,24 @@ HANDLE
 fhandler_pipe::get_query_hdl_per_process (WCHAR *name,
 					  OBJECT_NAME_INFORMATION *ntfn)
 {
-  NTSTATUS status;
-  ULONG len;
-  DWORD n_process = 256;
-  PSYSTEM_PROCESS_INFORMATION spi;
-  do
-    { /* Enumerate processes */
-      DWORD nbytes = n_process * sizeof (SYSTEM_PROCESS_INFORMATION);
-      spi = (PSYSTEM_PROCESS_INFORMATION) HeapAlloc (GetProcessHeap (),
-						     0, nbytes);
-      if (!spi)
-	return NULL;
-      status = NtQuerySystemInformation (SystemProcessInformation,
-					 spi, nbytes, &len);
-      if (NT_SUCCESS (status))
-	break;
-      HeapFree (GetProcessHeap (), 0, spi);
-      n_process *= 2;
-    }
-  while (n_process < (1L<<20) && status == STATUS_INFO_LENGTH_MISMATCH);
-  if (!NT_SUCCESS (status))
-    return NULL;
+  winpids pids ((DWORD) 0);
 
-  /* In most cases, it is faster to check the processes in reverse order.
-     To do this, store PIDs into an array. */
-  DWORD *proc_pids = (DWORD *) HeapAlloc (GetProcessHeap (), 0,
-					  n_process * sizeof (DWORD));
-  if (!proc_pids)
+  /* In most cases, it is faster to check the processes in reverse order. */
+  for (LONG i = (LONG) pids.npids - 1; i >= 0; i--)
     {
-      HeapFree (GetProcessHeap (), 0, spi);
-      return NULL;
-    }
-  PSYSTEM_PROCESS_INFORMATION p = spi;
-  n_process = 0;
-  while (true)
-    {
-      proc_pids[n_process++] = (DWORD)(intptr_t) p->UniqueProcessId;
-      if (!p->NextEntryOffset)
-	break;
-      p = (PSYSTEM_PROCESS_INFORMATION) ((char *) p + p->NextEntryOffset);
-    }
-  HeapFree (GetProcessHeap (), 0, spi);
+      NTSTATUS status;
+      ULONG len;
 
-  for (LONG i = (LONG) n_process - 1; i >= 0; i--)
-    {
+      /* Non-cygwin app may call ReadFile() for empty pipe, which makes
+	NtQueryObject() for ObjectNameInformation block. Therefore, do
+	not try to get query_hdl for non-cygwin apps. */
+      _pinfo *p = pids[i];
+      if (!p || ISSTATE (p, PID_NOTCYGWIN))
+	continue;
+
       HANDLE proc = OpenProcess (PROCESS_DUP_HANDLE
 				 | PROCESS_QUERY_INFORMATION,
-				 0, proc_pids[i]);
+				 0, p->dwProcessId);
       if (!proc)
 	continue;
 
@@ -1317,7 +1300,6 @@ fhandler_pipe::get_query_hdl_per_process (WCHAR *name,
 	      query_hdl_proc = proc;
 	      query_hdl_value = (HANDLE)(intptr_t) phi->Handles[j].HandleValue;
 	      HeapFree (GetProcessHeap (), 0, phi);
-	      HeapFree (GetProcessHeap (), 0, proc_pids);
 	      return h;
 	    }
 close_handle:
@@ -1327,7 +1309,6 @@ close_handle:
 close_proc:
       CloseHandle (proc);
     }
-  HeapFree (GetProcessHeap (), 0, proc_pids);
   return NULL;
 }
 
@@ -1400,4 +1381,55 @@ close_proc:
     }
   HeapFree (GetProcessHeap (), 0, shi);
   return NULL;
+}
+
+void
+fhandler_pipe::spawn_worker (int fileno_stdin, int fileno_stdout,
+			     int fileno_stderr)
+{
+  bool need_send_noncygchld_sig = false;
+
+  /* spawn_worker() is called from spawn.cc only when non-cygwin app
+     is started. Set pipe mode blocking for the non-cygwin process. */
+  int fd;
+  cygheap_fdenum cfd (false);
+  while ((fd = cfd.next ()) >= 0)
+    if (cfd->get_dev () == FH_PIPEW
+	&& (fd == fileno_stdout || fd == fileno_stderr))
+      {
+	fhandler_pipe *pipe = (fhandler_pipe *)(fhandler_base *) cfd;
+	pipe->set_pipe_non_blocking (false);
+
+	/* Setup for query_ndl stuff. Read the comment below. */
+	if (pipe->request_close_query_hdl ())
+	  need_send_noncygchld_sig = true;
+      }
+    else if (cfd->get_dev () == FH_PIPER && fd == fileno_stdin)
+      {
+	fhandler_pipe *pipe = (fhandler_pipe *)(fhandler_base *) cfd;
+	pipe->set_pipe_non_blocking (false);
+      }
+
+  /* If multiple writers including non-cygwin app exist, the non-cygwin
+     app cannot detect pipe closure on the read side when the pipe is
+     created by system account or the pipe creator is running as service.
+     This is because query_hdl which is held in write side also is a read
+     end of the pipe, so the pipe is still alive for the non-cygwin app
+     even after the reader is closed.
+
+     To avoid this problem, let all processes in the same process
+     group close query_hdl using internal signal __SIGNONCYGCHLD when
+     non-cygwin app is started.  */
+  if (need_send_noncygchld_sig)
+    {
+      tty_min dummy_tty;
+      dummy_tty.ntty = (fh_devices) myself->ctty;
+      dummy_tty.pgid = myself->pgid;
+      tty_min *t = cygwin_shared->tty.get_cttyp ();
+      if (!t) /* If tty is not allocated, use dummy_tty instead. */
+	t = &dummy_tty;
+      /* Emit __SIGNONCYGCHLD to let all processes in the
+	 process group close query_hdl. */
+      t->kill_pgrp (__SIGNONCYGCHLD);
+    }
 }
