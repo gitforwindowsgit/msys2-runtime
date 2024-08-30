@@ -1193,6 +1193,7 @@ private:
   uint64_t pipename_key;
   DWORD pipename_pid;
   LONG pipename_id;
+  bool was_blocking_read_pipe;
   void release_select_sem (const char *);
   HANDLE get_query_hdl_per_process (WCHAR *, OBJECT_NAME_INFORMATION *);
   HANDLE get_query_hdl_per_system (WCHAR *, OBJECT_NAME_INFORMATION *);
