@@ -54,6 +54,15 @@ fhandler_pipe::set_pipe_non_blocking (bool nonblocking)
   IO_STATUS_BLOCK io;
   FILE_PIPE_INFORMATION fpi;
 
+  if (get_device () == FH_PIPER && nonblocking && !was_blocking_read_pipe)
+    {
+      status = NtQueryInformationFile (get_handle (), &io, &fpi, sizeof fpi,
+				       FilePipeInformation);
+      if (NT_SUCCESS (status))
+	was_blocking_read_pipe =
+	  (fpi.CompletionMode == FILE_PIPE_QUEUE_OPERATION);
+    }
+
   fpi.ReadMode = FILE_PIPE_BYTE_STREAM_MODE;
   fpi.CompletionMode = nonblocking ? FILE_PIPE_COMPLETE_OPERATION
     : FILE_PIPE_QUEUE_OPERATION;
@@ -94,6 +103,8 @@ fhandler_pipe::init (HANDLE f, DWORD a, mode_t mode, int64_t uniq_id)
        even with FILE_SYNCHRONOUS_IO_NONALERT. */
     set_pipe_non_blocking (get_device () == FH_PIPER ?
 			   true : is_nonblocking ());
+  was_blocking_read_pipe = false;
+
   return 1;
 }
 
@@ -675,6 +686,8 @@ fhandler_pipe::close ()
     CloseHandle (query_hdl);
   if (query_hdl_close_req_evt)
     CloseHandle (query_hdl_close_req_evt);
+  if (was_blocking_read_pipe)
+    set_pipe_non_blocking (false);
   int ret = fhandler_base::close ();
   ReleaseMutex (hdl_cnt_mtx);
   CloseHandle (hdl_cnt_mtx);
