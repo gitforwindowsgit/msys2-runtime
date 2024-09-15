@@ -1197,6 +1197,8 @@ class fhandler_pipe: public fhandler_pipe_fifo
 private:
   HANDLE read_mtx;
   pid_t popen_pid;
+  bool was_blocking_read_pipe;
+  bool is_blocking_read_pipe;
   HANDLE query_hdl;
   HANDLE hdl_cnt_mtx;
   HANDLE query_hdl_proc;
@@ -1287,6 +1289,7 @@ public:
     }
   static void spawn_worker (int fileno_stdin, int fileno_stdout,
 			    int fileno_stderr);
+  static void sigproc_worker (void);
 };
 
 #define CYGWIN_FIFO_PIPE_NAME_LEN     47
@@ -2160,6 +2163,8 @@ class dev_console
   char *cons_rapoi;
   bool cursor_key_app_mode;
   bool disable_master_thread;
+  tty::cons_mode curr_input_mode;
+  tty::cons_mode curr_output_mode;
   bool master_thread_suspended;
   int num_processed; /* Number of input events in the current input buffer
 			already processed by cons_master_thread(). */
